@@ -23,6 +23,14 @@ enum Relationships {
     UNKNOWN = 5,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GaoRexfordPref {
+    NewAnnBetter,
+    OldAnnBetter,
+    NoAnnBetter,
+}
+
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Announcement {
     prefix: String,
@@ -159,8 +167,10 @@ struct BGPSimplePolicy {
     as_ref: Weak<AS>,
     local_rib: LocalRIB,
     recv_queue: RecvQueue,
-    gao_rexford_funcs: Vec<Box<dyn Fn(&Announcement, bool, Relationships, &Announcement, bool, Relationships) -> GaoRexfordPref>>,
 }
+
+
+//type GaoRexfordFunc = Box<dyn Fn(&Announcement, bool, Relationships, &Announcement, bool, Relationships) -> GaoRexfordPref>;
 
 impl BGPSimplePolicy {
     fn new(as_ref: Weak<AS>) -> BGPSimplePolicy {
@@ -205,7 +215,7 @@ impl BGPSimplePolicy {
 
     fn process_incoming_anns(&mut self, from_rel: Relationships, propagation_round: i32, reset_q: bool) {
         for (prefix, ann_list) in self.recv_queue.prefix_anns() {
-            let mut current_ann = self.local_rib.get_ann(&prefix).cloned();
+            let mut current_ann = self.local_rib.get_ann(&prefix).clone();
             let mut current_processed = current_ann.is_some();
 
             if current_ann.as_ref().map_or(false, |ann| ann.seed_asn.is_some()) {
@@ -213,12 +223,12 @@ impl BGPSimplePolicy {
             }
 
             for ann in ann_list {
-                if self.valid_ann(ann) {
-                    let new_ann_better = self._new_ann_better(
+                if self.valid_ann(&ann) {
+                    let new_ann_better = self.new_ann_better(
                         current_ann.as_ref(),
                         current_processed,
                         from_rel,
-                        ann,
+                        &ann,
                         false,
                         from_rel,
                     );
@@ -265,9 +275,9 @@ impl BGPSimplePolicy {
             if let Some(neighbors) = as_ref.get_neighbors(propagate_to) {
                 for neighbor in neighbors {
                     for (prefix, ann) in self.local_rib.prefix_anns() {
-                        if send_rels.contains(&ann.recv_relationship) && !self.prev_sent(neighbor, ann, propagate_to, send_rels.clone()) {
-                            if !self.policy_propagate(neighbor, ann, propagate_to, send_rels.clone()) {
-                                self.process_outgoing_ann(neighbor, ann, propagate_to, send_rels.clone());
+                        if send_rels.contains(&ann.recv_relationship) && !self.prev_sent(neighbor, &ann, propagate_to, send_rels.clone()) {
+                            if !self.policy_propagate(neighbor, &ann, propagate_to, send_rels.clone()) {
+                                self.process_outgoing_ann(neighbor, &ann, propagate_to, send_rels.clone());
                             }
                         }
                     }
@@ -277,23 +287,23 @@ impl BGPSimplePolicy {
     }
 
     fn propagate_to_providers(&self) {
-        let send_rels = vec![Relationships::Origin, Relationships::Customers];
-        self.propagate(Relationships::Providers, send_rels);
+        let send_rels = vec![Relationships::ORIGIN, Relationships::CUSTOMERS];
+        self.propagate(Relationships::PROVIDERS, send_rels);
     }
 
     fn propagate_to_customers(&self) {
         let send_rels = vec![
-            Relationships::Origin,
-            Relationships::Customers,
-            Relationships::Peers,
-            Relationships::Providers,
+            Relationships::ORIGIN,
+            Relationships::CUSTOMERS,
+            Relationships::PEERS,
+            Relationships::PROVIDERS,
         ];
-        self.propagate(Relationships::Customers, send_rels);
+        self.propagate(Relationships::CUSTOMERS, send_rels);
     }
 
     fn propagate_to_peers(&self) {
-        let send_rels = vec![Relationships::Origin, Relationships::Customers];
-        self.propagate(Relationships::Peers, send_rels);
+        let send_rels = vec![Relationships::ORIGIN, Relationships::CUSTOMERS];
+        self.propagate(Relationships::PEERS, send_rels);
     }
 
     /////// Gao Rexford
@@ -362,9 +372,9 @@ impl BGPSimplePolicy {
             default_new_recv_rel
         };
 
-        if current_rel as u32 > new_rel as u32 {
+        if (current_rel as u32) > (new_rel as u32) {
             GaoRexfordPref::OldAnnBetter
-        } else if current_rel as u32 < new_rel as u32 {
+        } else if (current_rel as u32) < (new_rel as u32) {
             GaoRexfordPref::NewAnnBetter
         } else {
             GaoRexfordPref::NoAnnBetter
@@ -382,7 +392,11 @@ impl BGPSimplePolicy {
     ) -> bool {
         match current_ann {
             Some(current_ann) => {
-                for func in &self.gao_rexford_funcs {
+                for func in &[
+                    BGPSimplePolicy::new_rel_better,
+                    BGPSimplePolicy::new_as_path_shorter,
+                    BGPSimplePolicy::new_wins_ties,
+                ] {
                     let gao_rexford_pref = func(
                         current_ann,
                         current_processed,
@@ -403,23 +417,6 @@ impl BGPSimplePolicy {
 
         panic!("No announcement was chosen in new_ann_better function")
     }
-
-
-    type GaoRexfordFunc = Box<dyn Fn(&Announcement, bool, Relationships, &Announcement, bool, Relationships) -> GaoRexfordPref>;
-
-    fn _gao_rexford_funcs(&self) -> Vec<Self::GaoRexfordFunc> {
-        vec![
-            Box::new(move |current_ann, current_processed, default_current_recv_rel, new_ann, new_processed, default_new_recv_rel| {
-                self.new_rel_better(current_ann, current_processed, default_current_recv_rel, new_ann, new_processed, default_new_recv_rel)
-            }),
-            Box::new(move |current_ann, current_processed, default_current_recv_rel, new_ann, new_processed, default_new_recv_rel| {
-                self.new_as_path_shorter(current_ann, current_processed, new_ann, new_processed)
-            }),
-            Box::new(move |current_ann, current_processed, default_current_recv_rel, new_ann, new_processed, default_new_recv_rel| {
-                self.new_wins_ties(current_ann, current_processed, default_current_recv_rel, new_ann, new_processed, default_new_recv_rel)
-            }),
-        ]
-    }
 }
 
 // Define the AS structure
@@ -433,12 +430,15 @@ struct AS {
     policy: RefCell<BGPSimplePolicy>,
 }
 
-fn get_neighbors(&self, relationship: Relationships) -> Option<&Vec<Rc<AS>>> {
-    match relationship {
-        Relationships::Peers => Some(&self.peers),
-        Relationships::Customers => Some(&self.customers),
-        Relationships::Providers => Some(&self.providers),
-        _ => None, // For Relationships::Origin or Relationships::Unknown, etc.
+
+impl AS {
+    fn get_neighbors(&self, relationship: Relationships) -> Option<&Vec<Rc<AS>>> {
+        match relationship {
+            Relationships::PEERS => Some(&self.peers),
+            Relationships::CUSTOMERS => Some(&self.customers),
+            Relationships::PROVIDERS => Some(&self.providers),
+            _ => None, // For Relationships::ORIGIN or Relationships::Unknown, etc.
+        }
     }
 }
 
