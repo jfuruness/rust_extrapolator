@@ -275,9 +275,9 @@ impl BGPSimplePolicy {
             if let Some(neighbors) = as_ref.get_neighbors(propagate_to) {
                 for neighbor in neighbors {
                     for (prefix, ann) in self.local_rib.prefix_anns() {
-                        if send_rels.contains(&ann.recv_relationship) && !self.prev_sent(neighbor, &ann, propagate_to, send_rels.clone()) {
-                            if !self.policy_propagate(neighbor, &ann, propagate_to, send_rels.clone()) {
-                                self.process_outgoing_ann(neighbor, &ann, propagate_to, send_rels.clone());
+                        if send_rels.contains(&ann.recv_relationship) && !self.prev_sent(&neighbor, &ann, propagate_to, send_rels.clone()) {
+                            if !self.policy_propagate(&neighbor, &ann, propagate_to, send_rels.clone()) {
+                                self.process_outgoing_ann(&neighbor, &ann, propagate_to, send_rels.clone());
                             }
                         }
                     }
@@ -309,25 +309,20 @@ impl BGPSimplePolicy {
     /////// Gao Rexford
     fn new_wins_ties(
         &self,
-        current_ann: &Option<Announcement>,
+        current_ann: &Announcement,
         current_processed: bool,
         default_current_recv_rel: Relationships,
         new_ann: &Announcement,
         new_processed: bool,
         default_new_recv_rel: Relationships,
     ) -> GaoRexfordPref {
-        let cur_index = if current_processed { current_ann.as_ref().map_or(0, |ann| ann.as_path.len()).saturating_sub(1) } else { 0 };
+        let cur_index = if new_processed { new_ann.as_path.len().saturating_sub(1) } else { 0 };
         let new_index = if new_processed { new_ann.as_path.len().saturating_sub(1) } else { 0 };
 
-        match current_ann {
-            Some(current_ann) => {
-                if new_ann.as_path.get(new_index) < current_ann.as_path.get(cur_index) {
-                    GaoRexfordPref::NewAnnBetter
-                } else {
-                    GaoRexfordPref::OldAnnBetter
-                }
-            }
-            None => GaoRexfordPref::NewAnnBetter, // If current_ann is None, new_ann is automatically better
+        if new_ann.as_path.get(new_index) < current_ann.as_path.get(cur_index) {
+            GaoRexfordPref::NewAnnBetter
+        } else {
+            GaoRexfordPref::OldAnnBetter
         }
     }
 
@@ -335,8 +330,10 @@ impl BGPSimplePolicy {
         &self,
         current_ann: &Announcement,
         current_processed: bool,
+        default_current_recv_rel: Relationships,
         new_ann: &Announcement,
         new_processed: bool,
+        default_new_recv_rel: Relationships,
     ) -> GaoRexfordPref {
         let current_as_path_len = current_ann.as_path.len() + if current_processed { 0 } else { 1 };
         let new_as_path_len = new_ann.as_path.len() + if new_processed { 0 } else { 1 };
@@ -383,21 +380,56 @@ impl BGPSimplePolicy {
 
     fn new_ann_better(
         &self,
-        current_ann: &Option<Announcement>,
+        current_ann: Option<&Announcement>,
         current_processed: bool,
         default_current_recv_rel: Relationships,
         new_ann: &Announcement,
         new_processed: bool,
         default_new_recv_rel: Relationships,
     ) -> bool {
+
+        if current_ann.is_none() {
+            return true;
+        }
+
         match current_ann {
             Some(current_ann) => {
                 for func in &[
+                    /*
                     BGPSimplePolicy::new_rel_better,
                     BGPSimplePolicy::new_as_path_shorter,
                     BGPSimplePolicy::new_wins_ties,
+                    */
+                    BGPSimplePolicy::new_rel_better as fn(
+                        &BGPSimplePolicy,
+                        &Announcement,
+                        bool,
+                        Relationships,
+                        &Announcement,
+                        bool,
+                        Relationships,
+                    ) -> GaoRexfordPref,
+                    BGPSimplePolicy::new_as_path_shorter as fn(
+                        &BGPSimplePolicy,
+                        &Announcement,
+                        bool,
+                        Relationships,
+                        &Announcement,
+                        bool,
+                        Relationships,
+                    ) -> GaoRexfordPref,
+                    BGPSimplePolicy::new_wins_ties as fn(
+                        &BGPSimplePolicy,
+                        &Announcement,
+                        bool,
+                        Relationships,
+                        &Announcement,
+                        bool,
+                        Relationships,
+                    ) -> GaoRexfordPref,
                 ] {
                     let gao_rexford_pref = func(
+                        &self,
                         current_ann,
                         current_processed,
                         default_current_recv_rel,
@@ -432,11 +464,20 @@ struct AS {
 
 
 impl AS {
-    fn get_neighbors(&self, relationship: Relationships) -> Option<&Vec<Rc<AS>>> {
+    fn get_neighbors(&self, relationship: Relationships) -> Option<Vec<Rc<AS>>> {
         match relationship {
-            Relationships::PEERS => Some(&self.peers),
-            Relationships::CUSTOMERS => Some(&self.customers),
-            Relationships::PROVIDERS => Some(&self.providers),
+            Relationships::PEERS => {
+                // Convert from RefCell<Vec<Weak<AS>>> to Vec<Rc<AS>>
+                Some(self.peers.borrow().iter().filter_map(|rc| rc.upgrade()).collect())
+            }
+            Relationships::CUSTOMERS => {
+                // Convert from RefCell<Vec<Weak<AS>>> to Vec<Rc<AS>>
+                Some(self.customers.borrow().iter().filter_map(|rc| rc.upgrade()).collect())
+            }
+            Relationships::PROVIDERS => {
+                // Convert from RefCell<Vec<Weak<AS>>> to Vec<Rc<AS>>
+                Some(self.providers.borrow().iter().filter_map(|rc| rc.upgrade()).collect())
+            }
             _ => None, // For Relationships::ORIGIN or Relationships::Unknown, etc.
         }
     }
