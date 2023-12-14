@@ -403,6 +403,23 @@ impl BGPSimplePolicy {
 
         panic!("No announcement was chosen in new_ann_better function")
     }
+
+
+    type GaoRexfordFunc = Box<dyn Fn(&Announcement, bool, Relationships, &Announcement, bool, Relationships) -> GaoRexfordPref>;
+
+    fn _gao_rexford_funcs(&self) -> Vec<Self::GaoRexfordFunc> {
+        vec![
+            Box::new(move |current_ann, current_processed, default_current_recv_rel, new_ann, new_processed, default_new_recv_rel| {
+                self.new_rel_better(current_ann, current_processed, default_current_recv_rel, new_ann, new_processed, default_new_recv_rel)
+            }),
+            Box::new(move |current_ann, current_processed, default_current_recv_rel, new_ann, new_processed, default_new_recv_rel| {
+                self.new_as_path_shorter(current_ann, current_processed, new_ann, new_processed)
+            }),
+            Box::new(move |current_ann, current_processed, default_current_recv_rel, new_ann, new_processed, default_new_recv_rel| {
+                self.new_wins_ties(current_ann, current_processed, default_current_recv_rel, new_ann, new_processed, default_new_recv_rel)
+            }),
+        ]
+    }
 }
 
 // Define the AS structure
