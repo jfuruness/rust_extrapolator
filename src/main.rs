@@ -77,24 +77,7 @@ impl Announcement {
         *self.as_path.last().unwrap()
     }
 }
-// Helper functions to parse specific types
-fn parse_as_path(input: &str) -> Vec<u32> {
-    input.split(',').filter_map(|s| s.trim().parse().ok()).collect()
-}
 
-fn parse_relationship(input: &str) -> Relationships {
-    match input {
-        "PROVIDERS" => Relationships::PROVIDERS,
-        "PEERS" => Relationships::PEERS,
-        "CUSTOMERS" => Relationships::CUSTOMERS,
-        "ORIGIN" => Relationships::ORIGIN,
-        _ => Relationships::UNKNOWN,
-    }
-}
-
-fn parse_communities(input: &str) -> Vec<String> {
-    input.split(',').map(|s| s.trim().to_string()).collect()
-}
 
 impl Hash for Announcement {
     fn hash<H: Hasher>(&self, state: &mut H) {
@@ -259,6 +242,167 @@ impl BGPSimplePolicy {
             self.reset_q(reset_q);
         }
     }
+
+    ///// process outgoing
+    fn policy_propagate(&self, neighbor: &Rc<AS>, ann: &Announcement, propagate_to: Relationships, send_rels: Vec<Relationships>) -> bool {
+        // Custom policy propagation logic can be implemented here
+        false
+    }
+
+    fn prev_sent(&self, neighbor: &Rc<AS>, ann: &Announcement, propagate_to: Relationships, send_rels: Vec<Relationships>) -> bool {
+        // Check if the announcement was previously sent to the neighbor
+        false
+    }
+
+    fn process_outgoing_ann(&self, neighbor: &Rc<AS>, ann: &Announcement, propagate_to: Relationships, send_rels: Vec<Relationships>) {
+        // Add the new announcement to the incoming announcements for that prefix
+        neighbor.policy.borrow_mut().receive_ann(ann);
+    }
+
+    fn propagate(&self, propagate_to: Relationships, send_rels: Vec<Relationships>) {
+        if let Some(as_ref) = self.as_ref.upgrade() {
+            // Assuming `as_ref` has a method `get_neighbors` to fetch neighbors based on the relationship
+            if let Some(neighbors) = as_ref.get_neighbors(propagate_to) {
+                for neighbor in neighbors {
+                    for (prefix, ann) in self.local_rib.prefix_anns() {
+                        if send_rels.contains(&ann.recv_relationship) && !self.prev_sent(neighbor, ann, propagate_to, send_rels.clone()) {
+                            if !self.policy_propagate(neighbor, ann, propagate_to, send_rels.clone()) {
+                                self.process_outgoing_ann(neighbor, ann, propagate_to, send_rels.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn propagate_to_providers(&self) {
+        let send_rels = vec![Relationships::Origin, Relationships::Customers];
+        self.propagate(Relationships::Providers, send_rels);
+    }
+
+    fn propagate_to_customers(&self) {
+        let send_rels = vec![
+            Relationships::Origin,
+            Relationships::Customers,
+            Relationships::Peers,
+            Relationships::Providers,
+        ];
+        self.propagate(Relationships::Customers, send_rels);
+    }
+
+    fn propagate_to_peers(&self) {
+        let send_rels = vec![Relationships::Origin, Relationships::Customers];
+        self.propagate(Relationships::Peers, send_rels);
+    }
+
+    /////// Gao Rexford
+    fn new_wins_ties(
+        &self,
+        current_ann: &Option<Announcement>,
+        current_processed: bool,
+        default_current_recv_rel: Relationships,
+        new_ann: &Announcement,
+        new_processed: bool,
+        default_new_recv_rel: Relationships,
+    ) -> GaoRexfordPref {
+        let cur_index = if current_processed { current_ann.as_ref().map_or(0, |ann| ann.as_path.len()).saturating_sub(1) } else { 0 };
+        let new_index = if new_processed { new_ann.as_path.len().saturating_sub(1) } else { 0 };
+
+        match current_ann {
+            Some(current_ann) => {
+                if new_ann.as_path.get(new_index) < current_ann.as_path.get(cur_index) {
+                    GaoRexfordPref::NewAnnBetter
+                } else {
+                    GaoRexfordPref::OldAnnBetter
+                }
+            }
+            None => GaoRexfordPref::NewAnnBetter, // If current_ann is None, new_ann is automatically better
+        }
+    }
+
+    fn new_as_path_shorter(
+        &self,
+        current_ann: &Announcement,
+        current_processed: bool,
+        new_ann: &Announcement,
+        new_processed: bool,
+    ) -> GaoRexfordPref {
+        let current_as_path_len = current_ann.as_path.len() + if current_processed { 0 } else { 1 };
+        let new_as_path_len = new_ann.as_path.len() + if new_processed { 0 } else { 1 };
+
+        if current_as_path_len < new_as_path_len {
+            GaoRexfordPref::OldAnnBetter
+        } else if current_as_path_len > new_as_path_len {
+            GaoRexfordPref::NewAnnBetter
+        } else {
+            GaoRexfordPref::NoAnnBetter
+        }
+    }
+
+
+    fn new_rel_better(
+        &self,
+        current_ann: &Announcement,
+        current_processed: bool,
+        default_current_recv_rel: Relationships,
+        new_ann: &Announcement,
+        new_processed: bool,
+        default_new_recv_rel: Relationships,
+    ) -> GaoRexfordPref {
+        let current_rel = if current_processed {
+            current_ann.recv_relationship
+        } else {
+            default_current_recv_rel
+        };
+
+        let new_rel = if new_processed {
+            new_ann.recv_relationship
+        } else {
+            default_new_recv_rel
+        };
+
+        if current_rel as u32 > new_rel as u32 {
+            GaoRexfordPref::OldAnnBetter
+        } else if current_rel as u32 < new_rel as u32 {
+            GaoRexfordPref::NewAnnBetter
+        } else {
+            GaoRexfordPref::NoAnnBetter
+        }
+    }
+
+    fn new_ann_better(
+        &self,
+        current_ann: &Option<Announcement>,
+        current_processed: bool,
+        default_current_recv_rel: Relationships,
+        new_ann: &Announcement,
+        new_processed: bool,
+        default_new_recv_rel: Relationships,
+    ) -> bool {
+        match current_ann {
+            Some(current_ann) => {
+                for func in &self.gao_rexford_funcs {
+                    let gao_rexford_pref = func(
+                        current_ann,
+                        current_processed,
+                        default_current_recv_rel,
+                        new_ann,
+                        new_processed,
+                        default_new_recv_rel,
+                    );
+                    match gao_rexford_pref {
+                        GaoRexfordPref::NewAnnBetter => return true,
+                        GaoRexfordPref::OldAnnBetter => return false,
+                        GaoRexfordPref::NoAnnBetter => continue,
+                    }
+                }
+            },
+            None => return true, // If there is no current announcement, new one is automatically better
+        }
+
+        panic!("No announcement was chosen in new_ann_better function")
+    }
 }
 
 // Define the AS structure
@@ -270,6 +414,15 @@ struct AS {
     peers: RefCell<Vec<Weak<AS>>>,
     propagation_rank: RefCell<Option<u32>>,
     policy: RefCell<BGPSimplePolicy>,
+}
+
+fn get_neighbors(&self, relationship: Relationships) -> Option<&Vec<Rc<AS>>> {
+    match relationship {
+        Relationships::Peers => Some(&self.peers),
+        Relationships::Customers => Some(&self.customers),
+        Relationships::Providers => Some(&self.providers),
+        _ => None, // For Relationships::Origin or Relationships::Unknown, etc.
+    }
 }
 
 // Define the ASGraph structure
