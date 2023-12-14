@@ -6,6 +6,7 @@ use std::rc::{Rc, Weak};
 use std::cell::RefCell;
 use std::hash::{Hash, Hasher};
 use std::fmt;
+use std::time::Instant;
 
 
 
@@ -486,12 +487,14 @@ impl AS {
 // Define the ASGraph structure
 struct ASGraph {
     ases: HashMap<u32, Rc<AS>>,
+    propagation_ranks: Vec<Vec<Rc<AS>>>,
 }
 
 impl ASGraph {
     fn new() -> ASGraph {
         ASGraph {
             ases: HashMap::new(),
+            propagation_ranks: Vec::new(),
         }
     }
 
@@ -548,6 +551,90 @@ impl ASGraph {
                 if let Some(provider) = provider_weak.upgrade() {
                     self._assign_ranks_helper(&provider, rank + 1);
                 }
+            }
+        }
+    }
+
+    fn get_propagation_ranks(&self) -> Vec<Vec<Rc<AS>>> {
+        // Determine the maximum rank
+        let max_rank = self.ases.values()
+            .filter_map(|as_obj| *as_obj.propagation_rank.borrow())
+            .max()
+            .unwrap_or(0);
+
+        // Create a vector of vectors for ranks
+        let mut ranks: Vec<Vec<Rc<AS>>> = vec![Vec::new(); max_rank as usize + 1];
+
+        // Append ASes into their proper rank
+        for as_obj in self.ases.values() {
+            if let Some(rank) = *as_obj.propagation_rank.borrow() {
+                // Insert the reference to the AS object
+                ranks[rank as usize].push(Rc::clone(as_obj));
+            }
+        }
+
+        // Sort ASes within each rank
+        for rank in ranks.iter_mut() {
+            rank.sort_by_key(|as_obj| as_obj.asn);
+        }
+
+        ranks
+    }
+
+    ///////sim funcs
+
+    fn propagate(&mut self, propagation_round: i32) {
+        self._propagate_to_providers(propagation_round);
+        self._propagate_to_peers(propagation_round);
+        self._propagate_to_customers(propagation_round);
+    }
+
+    fn _propagate_to_providers(&self, propagation_round: i32) {
+        // Propagation to providers
+        for (i, rank) in self.propagation_ranks.iter().enumerate() {
+            if i > 0 {
+                for as_obj in rank {
+                    as_obj.policy.borrow_mut().process_incoming_anns(
+                        Relationships::CUSTOMERS,
+                        propagation_round,
+                        true,
+                    );
+                }
+            }
+            for as_obj in rank {
+                as_obj.policy.borrow().propagate_to_providers();
+            }
+        }
+    }
+
+    fn _propagate_to_peers(&self, propagation_round: i32) {
+        // Propagation to peers
+        for as_obj in self.ases.values() {
+            as_obj.policy.borrow().propagate_to_peers();
+        }
+        for as_obj in self.ases.values() {
+            as_obj.policy.borrow_mut().process_incoming_anns(
+                Relationships::PEERS,
+                propagation_round,
+                true,
+            );
+        }
+    }
+
+    fn _propagate_to_customers(&self, propagation_round: i32) {
+        // Propagation to customers
+        for (i, rank) in self.propagation_ranks.iter().rev().enumerate() {
+            if i > 0 {
+                for as_obj in rank {
+                    as_obj.policy.borrow_mut().process_incoming_anns(
+                        Relationships::PROVIDERS,
+                        propagation_round,
+                        true,
+                    );
+                }
+            }
+            for as_obj in rank {
+                as_obj.policy.borrow().propagate_to_customers();
             }
         }
     }
@@ -611,6 +698,7 @@ fn main() -> io::Result<()> {
     }
 
     as_graph.calculate_propagation_ranks();
+    as_graph.propagation_ranks = as_graph.get_propagation_ranks();
 
     // Printing ranks for verification
     for (asn, as_obj) in as_graph.ases.iter() {
@@ -619,6 +707,39 @@ fn main() -> io::Result<()> {
         println!("ASN: {}, Rank: {}", asn, rank);
     }
 
+    // Check if AS 1 exists in the graph
+    if let Some(as1) = as_graph.ases.get(&1) {
+        // Use a for loop to create and seed 1000 unique announcements
+        for i in 0..100 {
+            // Generate a unique prefix for each announcement
+            let prefix = format!("1.2.{}.0/24", i);
+
+            // Create an announcement
+            let announcement = Announcement {
+                prefix,
+                as_path: vec![1], // Start with AS 1
+                timestamp: 0, // Set appropriate timestamp
+                seed_asn: Some(1),
+                roa_valid_length: None,
+                roa_origin: None,
+                recv_relationship: Relationships::ORIGIN,
+                withdraw: false,
+                traceback_end: false,
+                communities: vec![], // Add any necessary communities
+            };
+
+            // Seed the announcement in AS 1's LocalRIB
+            as1.policy.borrow_mut().local_rib.add_ann(announcement);
+        }
+    }
+
+    let start = Instant::now();
+    as_graph.propagate(0);
+    // Stop timing and calculate the duration
+    let duration = start.elapsed();
+
+    // Print out the time taken
+    println!("Time taken for propagation: {:?}", duration);
     Ok(())
 }
 // Helper function to parse ASN lists from the TSV
